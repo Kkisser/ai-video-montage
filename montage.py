@@ -350,6 +350,27 @@ def burn(video: Path, events: list[dict], hooks: list[dict],
          "-pix_fmt", "yuv420p", "-c:a", "copy", str(dst)])
 
 
+def speed_up(src: Path, dst: Path, speed: float) -> None:
+    """Ускорить видео и звук. Делается ДО тайминга слов, чтобы субтитры
+    легли на уже ускоренную дорожку (после — они бы разъехались)."""
+    # atempo принимает 0.5..2.0 — большее раскладываем цепочкой.
+    filters, s = [], speed
+    while s > 2.0:
+        filters.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        filters.append("atempo=0.5")
+        s /= 0.5
+    filters.append(f"atempo={s:.4f}")
+    run(["ffmpeg", "-y", "-i", str(src),
+         "-filter_complex",
+         f"[0:v]setpts=PTS/{speed:.4f}[v];[0:a]{','.join(filters)}[a]",
+         "-map", "[v]", "-map", "[a]",
+         "-r", "30", "-pix_fmt", "yuv420p",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+         "-c:a", "aac", "-ar", "48000", "-ac", "2", str(dst)])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clips", default=str(ROOT / "clips.json"))
@@ -357,11 +378,24 @@ def main() -> None:
     ap.add_argument("--min-sil", type=float, default=0.30)
     ap.add_argument("--pad", type=float, default=0.06)
     ap.add_argument("--model", default="medium")
+    # Флаги ниже нужны PostFlow (postflow/montage.py передаёт их всегда или
+    # по условию) — без них argparse падал и стык был сломан.
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
+                    help="устройство whisper (auto = пусть выберет сам)")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="ускорение готового ролика (1.0 = без)")
+    ap.add_argument("--title", default="", help="название серии для заставки")
+    ap.add_argument("--episode", default="", help="номер/подпись серии для заставки")
+    ap.add_argument("--sub-y", dest="sub_y", type=float, default=None,
+                    help="центр строки субтитров по высоте (0..1), дефолт 0.82")
     ap.add_argument("--words", type=int, default=1)
     ap.add_argument("--in", dest="in_dir", default=str(IN), help="папка-источник клипов")
     ap.add_argument("--out", default=str(OUT / "final.mp4"))
     ap.add_argument("--keep-silence", action="store_true")
     args = ap.parse_args()
+
+    if args.sub_y is not None:
+        SUB["y_center"] = max(0.05, min(0.95, args.sub_y))
 
     in_dir = Path(args.in_dir)
     WORK.mkdir(exist_ok=True)
@@ -399,6 +433,14 @@ def main() -> None:
     concat(parts, joined)
     print(f"→ Склеено: {joined.name} ({ffprobe_duration(joined):.1f}s)")
 
+    # Ускорение — ДО тайминга слов: whisper должен слышать финальную дорожку.
+    if args.speed and args.speed != 1.0:
+        sped = WORK / "joined_speed.mp4"
+        speed_up(joined, sped, args.speed)
+        joined = sped
+        durs = [d / args.speed for d in durs]
+        print(f"→ Ускорено x{args.speed}: {ffprobe_duration(joined):.1f}s")
+
     # позиции клипов на общей таймлинии склейки
     spans, acc = [], 0.0
     for d in durs:
@@ -408,11 +450,17 @@ def main() -> None:
     # Тайминг — ПО КАЖДОМУ клипу отдельно, со сдвигом на его позицию в склейке.
     print(f"→ Тайминг слов по клипам (whisper {args.model})…")
     from faster_whisper import WhisperModel
-    model = WhisperModel(args.model, device="cpu", compute_type="int8")
+    device = "cpu" if args.device == "auto" else args.device
+    model = WhisperModel(args.model, device=device, compute_type="int8")
     words = []
     for idx, dst in enumerate(parts):
         w = clip_words(model, dst, texts[idx])
         for x in w:
+            # Тайминг снят с клипа ДО ускорения — приводим к финальной скорости,
+            # потом сдвигаем на позицию клипа в склейке.
+            if args.speed and args.speed != 1.0:
+                x["start"] /= args.speed
+                x["end"] /= args.speed
             x["start"] += spans[idx][0]
             x["end"] += spans[idx][0]
         words += w
@@ -423,6 +471,10 @@ def main() -> None:
     # хук-плашки: показываем на всю длину своей сцены
     hooks = [{"start": spans[i][0], "end": spans[i][1], "text": c["hook"]}
              for i, c in enumerate(clips) if c.get("hook")]
+    # Заставка серии (--title/--episode от PostFlow): плашка в первые секунды.
+    label = " — ".join(x for x in (args.title.strip(), args.episode.strip()) if x)
+    if label:
+        hooks.insert(0, {"start": 0.0, "end": min(2.5, sum(durs)), "text": label})
     print(f"→ Плашек субтитров: {len(events)}, хук-плашек: {len(hooks)}")
 
     out = Path(args.out)
