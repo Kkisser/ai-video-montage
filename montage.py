@@ -15,8 +15,9 @@
 
 Полезные флаги:
     --noise -30dB     порог тишины (тише этого = пауза)
-    --min-sil 0.30    минимальная длина паузы, чтобы её резать (сек)
-    --pad 0.06        сколько звука оставить по краям речи (сек)
+    --cap 0.50        целевая макс. пауза между репликами (сек): длиннее —
+                      сжать до неё, короче — оставить; речь не режется
+    --detect-sil 0.20 порог детекта тишины (паузы короче игнорируются)
     --model medium    модель whisper (small|medium|large-v3)
     --words 1         слов на один субтитр (1 = как на референсе)
     --out out/final.mp4
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -50,6 +52,41 @@ SUB = dict(
     lowercase=True,          # строчными, как на референсе
 )
 
+def _sub_from_env() -> None:
+    """Настройки субтитров из приложения KADI.
+
+    Мост выставляет переменные окружения перед запуском сборки — так
+    параметры доходят сюда через PostFlow, не меняя его командную строку.
+    """
+    def num(name: str, lo: float, hi: float):
+        raw = os.environ.get(name, "")
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return v if lo <= v <= hi else None
+
+    size = num("KADI_SUB_SIZE", 24, 96)
+    if size:
+        SUB["size"] = int(size)
+        SUB["stroke"] = max(3, round(int(size) * 0.09))   # обводка за кеглем
+        SUB["space"] = max(8, round(int(size) * 0.3))
+    y = num("KADI_SUB_Y", 0.1, 0.95)
+    if y:
+        SUB["y_center"] = y
+    color = os.environ.get("KADI_SUB_COLOR", "").strip().lstrip("#")
+    if len(color) == 6:
+        try:
+            SUB["active"] = (*(int(color[i:i + 2], 16) for i in (0, 2, 4)), 255)
+        except ValueError:
+            pass
+    low = os.environ.get("KADI_SUB_LOWER", "")
+    if low in ("0", "1"):
+        SUB["lowercase"] = low == "1"
+
+
+_sub_from_env()
+
 # Плашка-хук (текст поверх целой сцены, напр. для сцены без реплик).
 HOOK = dict(
     font_path="/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -57,18 +94,26 @@ HOOK = dict(
     stroke=7, y_center=0.30, max_w_ratio=0.86, line_gap=10,
 )
 
-# Пресеты агрессивности резки пауз: (min_silence, pad) в секундах.
+# Пресеты резки пауз: целевая максимальная пауза между репликами (сек).
+# Паузу длиннее сжимаем до этого значения, короче — оставляем; речь не режем.
 TRIM = {
-    "tight":  (0.20, 0.03),   # режет плотно
-    "normal": (0.30, 0.06),   # по умолчанию
-    "loose":  (0.45, 0.12),   # бережно, оставляет воздух
+    "tight":  0.30,   # плотнее
+    "normal": 0.50,   # по умолчанию — 0,5 c воздуха между репликами
+    "loose":  0.80,   # больше воздуха
     # "none" — не резать вообще (обрабатывается отдельно)
 }
 
 # Мелкие правки авто-распознавания (бренд и т.п.). Регистронезависимо, по слову.
+# Бренд и линейка на экране пишутся латиницей — так они выглядят на упаковке
+# и в карточке товара; кириллица в субтитрах читается как ошибка.
 FIXUPS = {
-    r"^rive?l?line$": "revyline",
-    r"^reve?l?line$": "revyline",
+    r"^rive?l?line$": "Revyline",
+    r"^reve?l?line$": "Revyline",
+    r"^ревиe?лайн[а-яё]*$": "Revyline",
+    r"^ревай?лайн[а-яё]*$": "Revyline",
+    r"^ревилаин[а-яё]*$": "Revyline",
+    r"^кристал+[а-яё]*$": "Crystal",
+    r"^crystal$": "Crystal",
     r"^корода$": "щётка",
 }
 
@@ -103,21 +148,45 @@ def detect_silences(path: Path, noise: str, min_sil: float) -> list[tuple[float,
 
 
 def speech_intervals(dur: float, silences: list[tuple[float, float]],
-                     pad: float, min_keep: float = 0.05) -> list[tuple[float, float]]:
-    """Дополнение к тишине = речь. Расширяем на pad, склеиваем, чистим короткие."""
-    keeps, cur = [], 0.0
+                     cap: float, min_keep: float = 0.05) -> list[tuple[float, float]]:
+    """Оставляем ВСЮ речь целиком, а паузы (тишину) между репликами
+    укорачиваем до cap секунд — не режем речь, только лишнюю тишину.
+
+    Логика (решение Клейтона): паузу длиннее cap сжимаем до cap, обрезая её
+    СИММЕТРИЧНО ИЗ СЕРЕДИНЫ (по cap/2 к каждой соседней реплике), чтобы концы
+    фраз не подрезались и оставался «воздух» с обеих сторон. Паузу короче или
+    равную cap оставляем целиком — если второй персонаж быстро подхватил
+    реплику (короткая пауза), стык не трогаем.
+
+    `cap` — целевая максимальная пауза (сек). Историческое имя параметра было
+    `pad`; вызывающий код передаёт сюда значение из пресета TRIM.
+    """
+    # Речь = дополнение к тишине.
+    speech, cur = [], 0.0
     for s, e in silences:
         if s > cur:
-            keeps.append((cur, s))
+            speech.append((cur, s))
         cur = max(cur, e)
     if cur < dur:
-        keeps.append((cur, dur))
-    # паддинг + клиппинг
-    padded = [(max(0.0, s - pad), min(dur, e + pad)) for s, e in keeps]
-    # склейка пересечений
+        speech.append((cur, dur))
+    if not speech:
+        return [(0.0, dur)]  # весь клип — тишина (edge): не трогаем
+
+    # Собираем keep: каждая реплика + пауза после неё не длиннее cap.
+    result: list[list[float]] = []
+    for i, (s, e) in enumerate(speech):
+        result.append([s, e])
+        if i + 1 < len(speech):
+            gap_start, gap_end = e, speech[i + 1][0]
+            if gap_end - gap_start <= cap:
+                result[-1][1] = gap_end            # короткая пауза — оставить
+            else:
+                result[-1][1] = gap_start + cap / 2  # половина воздуха здесь
+                result.append([gap_end - cap / 2, gap_end])  # половина у следующей
+    # склейка смежных
     merged: list[list[float]] = []
-    for s, e in padded:
-        if merged and s <= merged[-1][1]:
+    for s, e in result:
+        if merged and s <= merged[-1][1] + 1e-6:
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
@@ -375,8 +444,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clips", default=str(ROOT / "clips.json"))
     ap.add_argument("--noise", default="-30dB")
-    ap.add_argument("--min-sil", type=float, default=0.30)
-    ap.add_argument("--pad", type=float, default=0.06)
+    # Целевая макс. пауза между репликами (сек): длиннее — сжать, короче — оставить.
+    ap.add_argument("--cap", type=float, default=0.50)
+    # Порог детекта тишины: паузы короче него игнорируются как естественные.
+    ap.add_argument("--detect-sil", dest="detect_sil", type=float, default=0.20)
+    # Обратная совместимость: PostFlow мог передавать старые флаги — принимаем,
+    # но --min-sil теперь маппится на detect_sil, --pad игнорируется.
+    ap.add_argument("--min-sil", dest="detect_sil", type=float, default=0.20,
+                    help="устар.: порог детекта тишины (= --detect-sil)")
+    ap.add_argument("--pad", type=float, default=0.06,
+                    help="устар.: больше не используется")
     ap.add_argument("--model", default="medium")
     # Флаги ниже нужны PostFlow (postflow/montage.py передаёт их всегда или
     # по условию) — без них argparse падал и стык был сломан.
@@ -388,7 +465,9 @@ def main() -> None:
     ap.add_argument("--episode", default="", help="номер/подпись серии для заставки")
     ap.add_argument("--sub-y", dest="sub_y", type=float, default=None,
                     help="центр строки субтитров по высоте (0..1), дефолт 0.82")
-    ap.add_argument("--words", type=int, default=1)
+    ap.add_argument("--words", type=int,
+                    default=int(os.environ.get("KADI_SUB_WORDS", 1) or 1),
+                    help="слов на один субтитр; KADI_SUB_WORDS задаёт умолчание")
     ap.add_argument("--in", dest="in_dir", default=str(IN), help="папка-источник клипов")
     ap.add_argument("--out", default=str(OUT / "final.mp4"))
     ap.add_argument("--keep-silence", action="store_true")
@@ -417,13 +496,16 @@ def main() -> None:
             copy_norm(src, dst)
             print(f"  [{idx}] {c['file']}: без резки")
         else:
-            min_sil, pad = TRIM.get(mode, (args.min_sil, args.pad))
+            # cap — целевая макс. пауза между репликами (из пресета или --cap).
+            cap = TRIM.get(mode, args.cap)
             dur = ffprobe_duration(src)
-            sils = detect_silences(src, args.noise, min_sil)
-            keeps = speech_intervals(dur, sils, pad)
+            # Детект тишины ловит паузы от короткого порога detect_sil, чтобы
+            # найти ВСЕ промежутки; сжимаем их до cap в speech_intervals.
+            sils = detect_silences(src, args.noise, args.detect_sil)
+            keeps = speech_intervals(dur, sils, cap)
             kept = sum(e - s for s, e in keeps)
             print(f"  [{idx}] {c['file']}: {dur:.1f}s → {kept:.1f}s "
-                  f"(вырезано {dur - kept:.1f}s, trim={mode})")
+                  f"(вырезано {dur - kept:.1f}s, пауза≤{cap}s, trim={mode})")
             trim_clip(src, keeps, dst)
         parts.append(dst)
         texts.append(c.get("text", ""))
