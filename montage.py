@@ -138,9 +138,16 @@ TRIM = {
 }
 
 # Мелкие правки авто-распознавания (бренд и т.п.). Регистронезависимо, по слову.
+# Бренд и линейка на экране пишутся латиницей — так они выглядят на упаковке
+# и в карточке товара (решение Кирилла 18.09); кириллица в субтитрах читается как ошибка.
 FIXUPS = {
-    r"^rive?l?line$": "revyline",
-    r"^reve?l?line$": "revyline",
+    r"^rive?l?line$": "Revyline",
+    r"^reve?l?line$": "Revyline",
+    r"^ревиe?лайн[а-яё]*$": "Revyline",
+    r"^ревай?лайн[а-яё]*$": "Revyline",
+    r"^ревилаин[а-яё]*$": "Revyline",
+    r"^кристал+[а-яё]*$": "Crystal",
+    r"^crystal$": "Crystal",
     r"^корода$": "щётка",
 }
 
@@ -460,8 +467,8 @@ def burn(video: Path, events: list[dict], hooks: list[dict],
 
 
 def speed_up(src: Path, dst: Path, speed: float) -> None:
-    """Ускорить видео и звук. Делается ДО тайминга слов, чтобы субтитры
-    легли на уже ускоренную дорожку (после — они бы разъехались)."""
+    """Ускорить видео и звук одним проходом. Применяется к ГОТОВОМУ ролику
+    с прожжёнными субтитрами: они ускоряются вместе с картинкой."""
     # atempo принимает 0.5..2.0 — большее раскладываем цепочкой.
     filters, s = [], speed
     while s > 2.0:
@@ -564,14 +571,6 @@ def main() -> None:
     concat(parts, joined)
     print(f"→ Склеено: {joined.name} ({ffprobe_duration(joined):.1f}s)")
 
-    # Ускорение — ДО тайминга слов: whisper должен слышать финальную дорожку.
-    if args.speed and args.speed != 1.0:
-        sped = WORK / "joined_speed.mp4"
-        speed_up(joined, sped, args.speed)
-        joined = sped
-        durs = [d / args.speed for d in durs]
-        print(f"→ Ускорено x{args.speed}: {ffprobe_duration(joined):.1f}s")
-
     # позиции клипов на общей таймлинии склейки
     spans, acc = [], 0.0
     for d in durs:
@@ -587,11 +586,8 @@ def main() -> None:
     for idx, dst in enumerate(parts):
         w = clip_words(model, dst, texts[idx])
         for x in w:
-            # Тайминг снят с клипа ДО ускорения — приводим к финальной скорости,
-            # потом сдвигаем на позицию клипа в склейке.
-            if args.speed and args.speed != 1.0:
-                x["start"] /= args.speed
-                x["end"] /= args.speed
+            # сдвиг на позицию клипа в склейке (скорость естественная: whisper
+            # слушал речь в нормальном темпе, ускорение — в самом конце)
             x["start"] += spans[idx][0]
             x["end"] += spans[idx][0]
             x["clip"] = idx          # плашка не пересекает границу клипа
@@ -610,7 +606,16 @@ def main() -> None:
     print(f"→ Плашек субтитров: {len(events)}, хук-плашек: {len(hooks)}")
 
     out = Path(args.out)
-    burn(joined, events, hooks, WORK / "subs", out)
+    if args.speed and args.speed != 1.0:
+        # Ускорение — В САМОМ КОНЦЕ, одним проходом по готовому ролику
+        # (решение Кирилла 14.09, подтверждено 18.09): субтитры уже прожжены и
+        # ускоряются вместе с картинкой, whisper слушал речь в естественном темпе.
+        burned = WORK / "burned.mp4"
+        burn(joined, events, hooks, WORK / "subs", burned)
+        print(f"→ Собрано: {ffprobe_duration(burned):.1f}s, ускоряю x{args.speed}…")
+        speed_up(burned, out, args.speed)
+    else:
+        burn(joined, events, hooks, WORK / "subs", out)
     print(f"✓ Готово: {out}  ({ffprobe_duration(out):.1f}s)")
     # Успех — промежуточные файлы не нужны (при ошибке папка остаётся для разбора).
     shutil.rmtree(WORK, ignore_errors=True)
