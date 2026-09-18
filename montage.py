@@ -15,8 +15,8 @@
 
 Полезные флаги:
     --noise -30dB     порог тишины (тише этого = пауза)
-    --cap 0.50        целевая макс. пауза между репликами (сек): длиннее —
-                      сжать до неё, короче — оставить; речь не режется
+    --cap 0.30        сколько тишины оставить по КРАЯМ клипа (сек): режем
+                      только начало и конец, внутренние паузы не трогаем
     --detect-sil 0.20 порог детекта тишины (паузы короче игнорируются)
     --model medium    модель whisper (small|medium|large-v3)
     --words 1         слов на один субтитр (1 = как на референсе)
@@ -29,35 +29,66 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 IN = ROOT / "in"
+# Базовая папка промежуточных файлов. В main() подменяется на подпапку
+# СВОЕГО запуска (work/<имя_ролика>_<pid>): оркестратор монтирует несколько
+# роликов параллельно, и общая папка приводила к подмене клипов и субтитров
+# между роликами (15.09: v27 получил видео v26, v28 — видео v29).
 WORK = ROOT / "work"
 OUT = ROOT / "out"
 
 # ---- Стиль субтитров (рисуются как PNG, накладываются overlay). Меняется здесь.
 VID_W, VID_H = 720, 1280
+# Шрифт субтитров и плашек: Rubik (Google Fonts, OFL), вариативный файл в fonts/,
+# вес 700 (решение Кирилла 17.09). Нет файла — откат на Arial Bold.
+FONT_RUBIK = ROOT / "fonts" / "Rubik[wght].ttf"
+FONT_FALLBACK = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+FONT_WEIGHT = 700
+
+
+def load_font(path, size: int, weight: int = FONT_WEIGHT):
+    """TrueType-шрифт нужного кегля; у вариативного выставляем вес."""
+    from PIL import ImageFont
+    p = Path(path)
+    if not p.exists():
+        p = Path(FONT_FALLBACK)
+    font = ImageFont.truetype(str(p), size)
+    try:
+        axes = font.get_variation_axes()
+    except OSError:          # обычный (не вариативный) шрифт
+        axes = []
+    if axes:
+        vals = [weight if a.get("name") in (b"Weight", "Weight", b"wght", "wght")
+                else a.get("default", 0) for a in axes]
+        font.set_variation_by_axes(vals)
+    return font
+
 SUB = dict(
-    font_path="/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    font_path=str(FONT_RUBIK),
     size=54,                 # кегль, px — компактно
-    active=(255, 255, 0, 255),   # активное слово: жёлтый
-    base=(255, 255, 255, 255),   # обычный текст: белый
+    active=(255, 255, 255, 255), # активное слово: белый (решение Кирилла 16.09)
+    base=(205, 205, 205, 255),   # остальные слова группы: светло-серый
     outline=(0, 0, 0, 255),      # обводка: чёрный
     stroke=5,                # толщина обводки, px
     space=16,                # зазор между словами в группе, px
     y_center=0.82,           # центр строки по высоте (0..1) — ниже
     lowercase=True,          # строчными, как на референсе
+    # Сколько символов (с пробелами) помещается в одну плашку при --words 0:
+    # слова набираются, пока сумма не превысит лимит; слово длиннее стоит одно.
+    # При кегле 54 это ~420 px из 720 — читается с запасом.
+    max_chars=14,
 )
 
 def _sub_from_env() -> None:
-    """Настройки субтитров из приложения KADI.
-
-    Мост выставляет переменные окружения перед запуском сборки — так
-    параметры доходят сюда через PostFlow, не меняя его командную строку.
-    """
+    """Настройки субтитров из приложения KADI (мост webapp/bridge.py выставляет
+    переменные окружения перед сборкой — так они доходят через PostFlow, не меняя
+    его командную строку). Без переменных действуют дефолты SUB выше."""
     def num(name: str, lo: float, hi: float):
         raw = os.environ.get(name, "")
         try:
@@ -83,37 +114,33 @@ def _sub_from_env() -> None:
     low = os.environ.get("KADI_SUB_LOWER", "")
     if low in ("0", "1"):
         SUB["lowercase"] = low == "1"
+    mc = num("KADI_SUB_MAXCHARS", 3, 40)
+    if mc:
+        SUB["max_chars"] = int(mc)
 
 
 _sub_from_env()
 
 # Плашка-хук (текст поверх целой сцены, напр. для сцены без реплик).
 HOOK = dict(
-    font_path="/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    font_path=str(FONT_RUBIK),
     size=74, color=(255, 255, 255, 255), outline=(0, 0, 0, 255),
     stroke=7, y_center=0.30, max_w_ratio=0.86, line_gap=10,
 )
 
-# Пресеты резки пауз: целевая максимальная пауза между репликами (сек).
-# Паузу длиннее сжимаем до этого значения, короче — оставляем; речь не режем.
+# Пресеты резки: сколько тишины оставить по КРАЯМ клипа (сек).
+# Режем только начало и конец; внутренние паузы не трогаем.
 TRIM = {
-    "tight":  0.30,   # плотнее
-    "normal": 0.50,   # по умолчанию — 0,5 c воздуха между репликами
-    "loose":  0.80,   # больше воздуха
+    "tight":  0.20,
+    "normal": 0.30,   # по умолчанию — 0,3 c тишины на входе и выходе клипа
+    "loose":  0.50,
     # "none" — не резать вообще (обрабатывается отдельно)
 }
 
 # Мелкие правки авто-распознавания (бренд и т.п.). Регистронезависимо, по слову.
-# Бренд и линейка на экране пишутся латиницей — так они выглядят на упаковке
-# и в карточке товара; кириллица в субтитрах читается как ошибка.
 FIXUPS = {
-    r"^rive?l?line$": "Revyline",
-    r"^reve?l?line$": "Revyline",
-    r"^ревиe?лайн[а-яё]*$": "Revyline",
-    r"^ревай?лайн[а-яё]*$": "Revyline",
-    r"^ревилаин[а-яё]*$": "Revyline",
-    r"^кристал+[а-яё]*$": "Crystal",
-    r"^crystal$": "Crystal",
+    r"^rive?l?line$": "revyline",
+    r"^reve?l?line$": "revyline",
     r"^корода$": "щётка",
 }
 
@@ -149,48 +176,42 @@ def detect_silences(path: Path, noise: str, min_sil: float) -> list[tuple[float,
 
 def speech_intervals(dur: float, silences: list[tuple[float, float]],
                      cap: float, min_keep: float = 0.05) -> list[tuple[float, float]]:
-    """Оставляем ВСЮ речь целиком, а паузы (тишину) между репликами
-    укорачиваем до cap секунд — не режем речь, только лишнюю тишину.
+    """Режем ТОЛЬКО тишину по краям клипа (в начале и в конце). Всё, что
+    внутри — речь и внутренние паузы — оставляем нетронутым.
 
-    Логика (решение Клейтона): паузу длиннее cap сжимаем до cap, обрезая её
-    СИММЕТРИЧНО ИЗ СЕРЕДИНЫ (по cap/2 к каждой соседней реплике), чтобы концы
-    фраз не подрезались и оставался «воздух» с обеих сторон. Паузу короче или
-    равную cap оставляем целиком — если второй персонаж быстро подхватил
-    реплику (короткая пауза), стык не трогаем.
+    Логика (решение Клейтона, сентябрь): каждый клип из Flow — это отдельная
+    сцена длиной 4–10 сек. Часто в начале и в конце есть «мёртвая» пауза
+    (персонаж молчит до/после реплики). Её и режем: если пауза с края длиннее
+    cap — обрезаем край так, чтобы осталось ровно cap секунд тишины; если
+    короче или её нет — не трогаем. Внутренние паузы между словами/репликами
+    НЕ трогаем вообще: если внутри диалога есть длинные дыры — это правится в
+    сценарии (объём текста под длительность), а не монтажом.
 
-    `cap` — целевая максимальная пауза (сек). Историческое имя параметра было
-    `pad`; вызывающий код передаёт сюда значение из пресета TRIM.
+    `cap` — сколько тишины оставить с каждого края (сек).
+    Возвращает один keep-интервал [start, end] — обрезанный по краям клип.
     """
-    # Речь = дополнение к тишине.
-    speech, cur = [], 0.0
-    for s, e in silences:
-        if s > cur:
-            speech.append((cur, s))
-        cur = max(cur, e)
-    if cur < dur:
-        speech.append((cur, dur))
-    if not speech:
-        return [(0.0, dur)]  # весь клип — тишина (edge): не трогаем
+    # Границы речи: первый и последний момент, когда есть звук.
+    # Тишина в начале = первый silence, начинающийся с ~0.
+    lead = 0.0   # сколько тишины в начале
+    tail_start = dur  # где начинается финальная тишина (по умолчанию — конец)
 
-    # Собираем keep: каждая реплика + пауза после неё не длиннее cap.
-    result: list[list[float]] = []
-    for i, (s, e) in enumerate(speech):
-        result.append([s, e])
-        if i + 1 < len(speech):
-            gap_start, gap_end = e, speech[i + 1][0]
-            if gap_end - gap_start <= cap:
-                result[-1][1] = gap_end            # короткая пауза — оставить
-            else:
-                result[-1][1] = gap_start + cap / 2  # половина воздуха здесь
-                result.append([gap_end - cap / 2, gap_end])  # половина у следующей
-    # склейка смежных
-    merged: list[list[float]] = []
-    for s, e in result:
-        if merged and s <= merged[-1][1] + 1e-6:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    return [(s, e) for s, e in merged if e - s >= min_keep]
+    if silences:
+        s0, e0 = silences[0]
+        if s0 <= 0.02:            # тишина прямо с начала клипа
+            lead = e0
+        sN, eN = silences[-1]
+        if eN >= dur - 0.02:      # тишина до самого конца клипа
+            tail_start = sN
+
+    # Обрезаем начало: оставляем не больше cap тишины перед речью.
+    start = max(0.0, lead - cap) if lead > cap else 0.0
+    # Обрезаем конец: оставляем не больше cap тишины после речи.
+    tail_len = dur - tail_start
+    end = tail_start + cap if tail_len > cap else dur
+
+    if end - start < min_keep:
+        return [(0.0, dur)]  # почти всё — тишина: не трогаем, отдаём как есть
+    return [(round(start, 3), round(end, 3))]
 
 
 # ---- 2. Обрезка одного клипа по интервалам речи ----------------------------
@@ -259,17 +280,13 @@ def align_text(provided: str, timing: list[dict]) -> list[dict]:
 
 
 def clip_words(model, path: Path, provided: str) -> list[dict]:
+    """Слова сценария, разложенные по таймингу речи. Нет текста в сценарии —
+    нет субтитров: распознанное whisper НЕ показываем (на тишине он выдумывает
+    «Редактор субтитров…» — 16.09, v30)."""
+    if not provided.strip():
+        return []
     timing = transcribe_clip(model, path)
-    if provided.strip():
-        return align_text(provided, timing)
-    # нет текста в сценарии — берём распознанное (только времена + слова)
-    segs, _ = model.transcribe(str(path), language="ru", word_timestamps=True)
-    out = []
-    for s in segs:
-        for w in (s.words or []):
-            if w.word.strip():
-                out.append({"start": w.start, "end": w.end, "text": w.word.strip()})
-    return out
+    return align_text(provided, timing)
 
 
 _PUNCT_RE = re.compile(r"[^\w]", re.UNICODE)
@@ -308,9 +325,29 @@ def numberize_seq(tokens: list[str]) -> list[str]:
 
 
 # ---- 5. События субтитров и рендер PNG -------------------------------------
-def build_events(words: list[dict], per_group: int) -> list[dict]:
-    """Каждое событие = одна показанная плашка с одним активным (жёлтым) словом.
-    При per_group>1 в плашке видно несколько слов, активное подсвечивается по очереди."""
+def group_by_chars(clean: list[dict], max_chars: int) -> list[list[dict]]:
+    """Группы слов для одной плашки: набираем, пока сумма символов с пробелами
+    не превысит max_chars; слово длиннее лимита стоит одно; группа не
+    пересекает границу клипа (поле clip)."""
+    groups, cur, cur_len = [], [], 0
+    for w in clean:
+        n = len(w["text"])
+        same_clip = not cur or cur[-1].get("clip") == w.get("clip")
+        if cur and (not same_clip or cur_len + 1 + n > max_chars):
+            groups.append(cur)
+            cur, cur_len = [], 0
+        cur.append(w)
+        cur_len = n if cur_len == 0 else cur_len + 1 + n
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def build_events(words: list[dict], per_group: int,
+                 max_chars: int | None = None) -> list[dict]:
+    """Каждое событие = одна показанная плашка с одним активным словом.
+    per_group>0 — фиксированное число слов в плашке; per_group<=0 — группировка
+    по символам (max_chars, см. SUB["max_chars"]). Активное подсвечивается по очереди."""
     # чистим слова, выкидываем те, что стали пустыми (были только пунктуацией)
     clean = [{**w, "text": fixup(w["text"])} for w in words]
     clean = [w for w in clean if w["text"]]
@@ -318,9 +355,12 @@ def build_events(words: list[dict], per_group: int) -> list[dict]:
     nums = numberize_seq([w["text"] for w in clean])
     for w, t in zip(clean, nums):
         w["text"] = t
+    if per_group and per_group > 0:
+        groups = [clean[i:i + per_group] for i in range(0, len(clean), per_group)]
+    else:
+        groups = group_by_chars(clean, int(max_chars or SUB["max_chars"]))
     events = []
-    for i in range(0, len(clean), per_group):
-        group = clean[i:i + per_group]
+    for group in groups:
         tokens = [w["text"] for w in group]
         for j, w in enumerate(group):
             events.append({"start": w["start"], "end": w["end"],
@@ -331,7 +371,7 @@ def build_events(words: list[dict], per_group: int) -> list[dict]:
 def render_event_png(tokens: list[str], active: int, path: Path):
     """Рисует строку слов: активное — жёлтым, остальные — белым, с чёрной обводкой."""
     from PIL import Image, ImageDraw, ImageFont
-    font = ImageFont.truetype(SUB["font_path"], SUB["size"])
+    font = load_font(SUB["font_path"], SUB["size"])
     st, sp = SUB["stroke"], SUB["space"]
     probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
     widths = [probe.textlength(t, font=font) for t in tokens]
@@ -354,7 +394,7 @@ def render_event_png(tokens: list[str], active: int, path: Path):
 def render_hook_png(text: str, path: Path):
     """Плашка-хук: крупный белый текст с переносом по словам, с обводкой."""
     from PIL import Image, ImageDraw, ImageFont
-    font = ImageFont.truetype(HOOK["font_path"], HOOK["size"])
+    font = load_font(HOOK["font_path"], HOOK["size"])
     st = HOOK["stroke"]
     max_w = int(VID_W * HOOK["max_w_ratio"])
     probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
@@ -420,8 +460,8 @@ def burn(video: Path, events: list[dict], hooks: list[dict],
 
 
 def speed_up(src: Path, dst: Path, speed: float) -> None:
-    """Ускорить видео и звук одним проходом. Применяется к ГОТОВОМУ ролику
-    с прожжёнными субтитрами: они ускоряются вместе с картинкой."""
+    """Ускорить видео и звук. Делается ДО тайминга слов, чтобы субтитры
+    легли на уже ускоренную дорожку (после — они бы разъехались)."""
     # atempo принимает 0.5..2.0 — большее раскладываем цепочкой.
     filters, s = [], speed
     while s > 2.0:
@@ -445,7 +485,7 @@ def main() -> None:
     ap.add_argument("--clips", default=str(ROOT / "clips.json"))
     ap.add_argument("--noise", default="-30dB")
     # Целевая макс. пауза между репликами (сек): длиннее — сжать, короче — оставить.
-    ap.add_argument("--cap", type=float, default=0.50)
+    ap.add_argument("--cap", type=float, default=0.30)
     # Порог детекта тишины: паузы короче него игнорируются как естественные.
     ap.add_argument("--detect-sil", dest="detect_sil", type=float, default=0.20)
     # Обратная совместимость: PostFlow мог передавать старые флаги — принимаем,
@@ -466,8 +506,11 @@ def main() -> None:
     ap.add_argument("--sub-y", dest="sub_y", type=float, default=None,
                     help="центр строки субтитров по высоте (0..1), дефолт 0.82")
     ap.add_argument("--words", type=int,
-                    default=int(os.environ.get("KADI_SUB_WORDS", 1) or 1),
-                    help="слов на один субтитр; KADI_SUB_WORDS задаёт умолчание")
+                    default=int(os.environ.get("KADI_SUB_WORDS", 0) or 0),
+                    help="слов в плашке; 0 = авто по символам (--max-chars); "
+                         "KADI_SUB_WORDS задаёт умолчание")
+    ap.add_argument("--max-chars", dest="max_chars", type=int, default=None,
+                    help=f"лимит символов в плашке при --words 0 (дефолт {SUB['max_chars']})")
     ap.add_argument("--in", dest="in_dir", default=str(IN), help="папка-источник клипов")
     ap.add_argument("--out", default=str(OUT / "final.mp4"))
     ap.add_argument("--keep-silence", action="store_true")
@@ -475,9 +518,15 @@ def main() -> None:
 
     if args.sub_y is not None:
         SUB["y_center"] = max(0.05, min(0.95, args.sub_y))
+    if args.max_chars:
+        SUB["max_chars"] = max(3, args.max_chars)
 
     in_dir = Path(args.in_dir)
-    WORK.mkdir(exist_ok=True)
+    # Своя рабочая папка на запуск — параллельные монтажи не мешают друг другу.
+    global WORK
+    WORK = ROOT / "work" / f"{Path(args.out).stem}_{os.getpid()}"
+    WORK.mkdir(parents=True, exist_ok=True)
+    print(f"→ Рабочая папка: {WORK.relative_to(ROOT)}")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     spec = json.loads(Path(args.clips).read_text())
@@ -505,7 +554,7 @@ def main() -> None:
             keeps = speech_intervals(dur, sils, cap)
             kept = sum(e - s for s, e in keeps)
             print(f"  [{idx}] {c['file']}: {dur:.1f}s → {kept:.1f}s "
-                  f"(вырезано {dur - kept:.1f}s, пауза≤{cap}s, trim={mode})")
+                  f"(вырезано {dur - kept:.1f}s, края≤{cap}s, trim={mode})")
             trim_clip(src, keeps, dst)
         parts.append(dst)
         texts.append(c.get("text", ""))
@@ -514,6 +563,14 @@ def main() -> None:
     joined = WORK / "joined.mp4"
     concat(parts, joined)
     print(f"→ Склеено: {joined.name} ({ffprobe_duration(joined):.1f}s)")
+
+    # Ускорение — ДО тайминга слов: whisper должен слышать финальную дорожку.
+    if args.speed and args.speed != 1.0:
+        sped = WORK / "joined_speed.mp4"
+        speed_up(joined, sped, args.speed)
+        joined = sped
+        durs = [d / args.speed for d in durs]
+        print(f"→ Ускорено x{args.speed}: {ffprobe_duration(joined):.1f}s")
 
     # позиции клипов на общей таймлинии склейки
     spans, acc = [], 0.0
@@ -530,9 +587,14 @@ def main() -> None:
     for idx, dst in enumerate(parts):
         w = clip_words(model, dst, texts[idx])
         for x in w:
-            # сдвиг на позицию клипа в склейке (скорость пока естественная)
+            # Тайминг снят с клипа ДО ускорения — приводим к финальной скорости,
+            # потом сдвигаем на позицию клипа в склейке.
+            if args.speed and args.speed != 1.0:
+                x["start"] /= args.speed
+                x["end"] /= args.speed
             x["start"] += spans[idx][0]
             x["end"] += spans[idx][0]
+            x["clip"] = idx          # плашка не пересекает границу клипа
         words += w
         print(f"  [{idx}] слов: {len(w)}")
 
@@ -548,17 +610,10 @@ def main() -> None:
     print(f"→ Плашек субтитров: {len(events)}, хук-плашек: {len(hooks)}")
 
     out = Path(args.out)
-    if args.speed and args.speed != 1.0:
-        # Ускорение — В САМОМ КОНЦЕ, одним проходом по готовому ролику
-        # (решение Кирилла, 14.09): субтитры уже прожжены и ускоряются вместе
-        # с картинкой, whisper слушал речь в естественном темпе.
-        burned = WORK / "burned.mp4"
-        burn(joined, events, hooks, WORK / "subs", burned)
-        print(f"→ Собрано: {ffprobe_duration(burned):.1f}s, ускоряю x{args.speed}…")
-        speed_up(burned, out, args.speed)
-    else:
-        burn(joined, events, hooks, WORK / "subs", out)
+    burn(joined, events, hooks, WORK / "subs", out)
     print(f"✓ Готово: {out}  ({ffprobe_duration(out):.1f}s)")
+    # Успех — промежуточные файлы не нужны (при ошибке папка остаётся для разбора).
+    shutil.rmtree(WORK, ignore_errors=True)
 
 
 if __name__ == "__main__":
